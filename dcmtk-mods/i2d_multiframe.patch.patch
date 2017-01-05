@@ -1,0 +1,959 @@
+From 6e7e574ae82a1470db751bfcb801e00f048a532c Mon Sep 17 00:00:00 2001
+From: Hanno Hugenberg <hanno.hugenberg@pergamonmed.com>
+Date: Tue, 4 Aug 2015 11:49:32 +0200
+Subject: [PATCH] * added multiframe creation functionality to image2dicom. **
+ changed calling convention for readPixelData to fetch image parameter
+ information as a struct for easier parameter comparism ** added new
+ parameters to image2dicom to allow input handling as directory ** set
+ standard output plugin for multiframe image input ** todo: bitmap data
+ multiframe is deep copied when added to dataset. This should be reworked to
+ avoid a deep copy and do half the memory consumption. * changed i2dbmp test
+ to new function parameters
+
+---
+ dcmdata/apps/img2dcm.cc                        |  64 +++++-
+ dcmdata/include/dcmtk/dcmdata/libi2d/i2d.h     |  17 +-
+ dcmdata/include/dcmtk/dcmdata/libi2d/i2dbmps.h |  30 +--
+ dcmdata/include/dcmtk/dcmdata/libi2d/i2dimgs.h |  91 ++++++---
+ dcmdata/include/dcmtk/dcmdata/libi2d/i2djpgs.h |  32 +--
+ dcmdata/libi2d/i2d.cc                          | 269 +++++++++++++++++--------
+ dcmdata/libi2d/i2dbmps.cc                      |  39 ++--
+ dcmdata/libi2d/i2djpgs.cc                      |  45 ++---
+ dcmdata/libi2d/i2dplnsc.cc                     |   8 +-
+ dcmdata/tests/ti2dbmp.cc                       |  12 +-
+ 10 files changed, 364 insertions(+), 243 deletions(-)
+
+diff --git a/dcmdata/apps/img2dcm.cc b/dcmdata/apps/img2dcm.cc
+index e547b5e..479fbfa 100644
+--- a/dcmdata/apps/img2dcm.cc
++++ b/dcmdata/apps/img2dcm.cc
+@@ -36,6 +36,10 @@
+ #define OFFIS_CONSOLE_APPLICATION "img2dcm"
+ static char rcsid[] = "$dcmtk: " OFFIS_CONSOLE_APPLICATION " v" OFFIS_DCMTK_VERSION " " OFFIS_DCMTK_RELEASEDATE " $";
+ 
++#if defined (HAVE_WINDOWS_H) || defined(HAVE_FNMATCH_H)
++#define PATTERN_MATCHING_AVAILABLE
++#endif
++
+ #define SHORTCOL 4
+ #define LONGCOL 21
+ 
+@@ -110,6 +114,14 @@ static void addCmdLineOptions(OFCommandLine& cmd)
+       cmd.addOption("--disable-ext",         "-de",     "disable support for extended sequential JPEG");
+       cmd.addOption("--insist-on-jfif",      "-jf",     "insist on JFIF header");
+       cmd.addOption("--keep-appn",           "-ka",     "keep APPn sections (except JFIF)");
++    cmd.addSubGroup("input files:");
++      cmd.addOption("--scan-directory",      "+sd",    "scan directory for input files (imgfile-in)");
++#ifdef PATTERN_MATCHING_AVAILABLE
++      cmd.addOption("--scan-pattern",        "+sp", 1, "[p]attern: string (only with --scan-directories)",
++                                                       "pattern for filename matching (wildcards)");
++#endif
++      cmd.addOption("--no-recurse",          "-r",     "do not recurse within directories (default)");
++      cmd.addOption("--recurse",             "+r",     "recurse within specified directories");
+ 
+   cmd.addGroup("processing options:", LONGCOL, SHORTCOL + 2);
+     cmd.addSubGroup("attribute checking:");
+@@ -129,7 +141,7 @@ static void addCmdLineOptions(OFCommandLine& cmd)
+   cmd.addGroup("output options:");
+     cmd.addSubGroup("target SOP class:");
+       cmd.addOption("--sec-capture",         "-sc",     "write Secondary Capture SOP class (default)");
+-      cmd.addOption("--new-sc",              "-nsc",    "write new Secondary Capture SOP classes");
++      cmd.addOption("--new-sc",              "-nsc",    "write new Multiframe Secondary Capture SOP classes (default for multiframe)");
+       cmd.addOption("--vl-photo",            "-vlp",    "write Visible Light Photographic SOP class");
+ 
+     cmd.addSubGroup("output file format:");
+@@ -155,7 +167,7 @@ static OFCondition startConversion(OFCommandLine& cmd,
+ {
+   // Parse command line and exclusive options
+   prepareCmdLineArgs(argc, argv, OFFIS_CONSOLE_APPLICATION);
+-  OFConsoleApplication app(OFFIS_CONSOLE_APPLICATION, "Convert standard image formats into DICOM format", rcsid);
++  OFConsoleApplication app(OFFIS_CONSOLE_APPLICATION, "Convert standard image formats into DICOM format. Supports multiframe creation.", rcsid);
+   if (app.parseCommandLine(cmd, argc, argv))
+   {
+     /* check exclusive options first */
+@@ -195,6 +207,13 @@ static OFCondition startConversion(OFCommandLine& cmd,
+   // The transfer syntax proposed to be written by output plugin
+   E_TransferSyntax writeXfer;
+ 
++  //input file options
++  OFBool    scanDir = OFFalse;
++  OFBool    recurse = OFFalse;
++  OFString  scanPattern = "";
++
++  //input file(s)
++  OFList<OFString> inputFiles;
+   // Parse rest of command line options
+   OFLog::configureFromCommandLine(cmd, app);
+ 
+@@ -244,6 +263,37 @@ static OFCondition startConversion(OFCommandLine& cmd,
+   }
+   OFLOG_INFO(img2dcmLogger, OFFIS_CONSOLE_APPLICATION ": Instantiated input plugin: " << inputPlug->inputFormat());
+ 
++  if (cmd.findOption("--scan-directory")) scanDir = OFTrue;
++#ifdef PATTERN_MATCHING_AVAILABLE
++  if (cmd.findOption("--scan-pattern"))
++  {
++    app.checkDependence("--scan-pattern", "--scan-directory", scanDir);
++    app.checkValue(cmd.getValue(scanPattern));
++  }
++#endif
++  cmd.beginOptionBlock();
++  if (cmd.findOption("--no-recurse")) recurse = OFFalse;
++  if (cmd.findOption("--recurse"))
++  {
++    app.checkDependence("--recurse", "--scan-directories", scanDir);
++    recurse = OFTrue;
++  }
++  cmd.endOptionBlock();
++  
++  //scan for input files
++  if (scanDir)
++  {
++    //validate directory for beeing directory or file
++    if (!OFStandard::dirExists(pixDataFile))
++    {
++      OFLOG_ERROR(img2dcmLogger, "Directory input scanning option needs a folder as input");
++      return EC_IllegalCall;
++    }
++    OFStandard::searchDirectoryRecursively( pixDataFile, inputFiles, scanPattern, "", recurse );
++  }
++  else
++    inputFiles.push_front(pixDataFile);
++	
+  // Find out which plugin to use
+   cmd.beginOptionBlock();
+   if (cmd.findOption("--sec-capture"))
+@@ -256,7 +306,12 @@ static OFCondition startConversion(OFCommandLine& cmd,
+     outPlug = new I2DOutputPlugNewSC();
+   cmd.endOptionBlock();
+   if (!outPlug) // default is the old Secondary Capture object
+-    outPlug = new I2DOutputPlugSC();
++  {
++    if (scanDir) //default for multiframe input is new Multiframe Secondary Caputrue
++      outPlug = new I2DOutputPlugNewSC();
++    else
++      outPlug = new I2DOutputPlugSC();
++  }
+   if (outPlug == NULL) return EC_MemoryExhausted;
+   OFLOG_INFO(img2dcmLogger, OFFIS_CONSOLE_APPLICATION ": Instantiated output plugin: " << outPlug->ident());
+ 
+@@ -368,7 +423,6 @@ static OFCondition startConversion(OFCommandLine& cmd,
+     if ( cmd.findOption("--keep-appn") )
+       jpgSource->setKeepAPPn(OFTrue);
+   }
+-  inputPlug->setImageFile(pixDataFile);
+ 
+   /* make sure data dictionary is loaded */
+   if (!dcmDataDict.isDictionaryLoaded())
+@@ -379,7 +433,7 @@ static OFCondition startConversion(OFCommandLine& cmd,
+ 
+   DcmDataset *resultObject = NULL;
+   OFLOG_INFO(img2dcmLogger, OFFIS_CONSOLE_APPLICATION ": Starting image conversion");
+-  cond = i2d.convert(inputPlug, outPlug, resultObject, writeXfer);
++  cond = i2d.convert(inputPlug, outPlug, &inputFiles, resultObject, writeXfer);
+ 
+   // Save
+   if (cond.good())
+diff --git a/dcmdata/include/dcmtk/dcmdata/libi2d/i2d.h b/dcmdata/include/dcmtk/dcmdata/libi2d/i2d.h
+index cb1fb08..a715d0e 100644
+--- a/dcmdata/include/dcmtk/dcmdata/libi2d/i2d.h
++++ b/dcmdata/include/dcmtk/dcmdata/libi2d/i2d.h
+@@ -42,6 +42,7 @@ public:
+    *  a dataset with the resulting DICOM object.
+    *  @param inputPlug - [in] The input plugin to read pixel data
+    *  @param outPlug - [in] The output plugin for specific SOP class output
++   *  @param imageFiles - [in] The image input file(s) as source for the input plugin
+    *  @param resultDset - [out] The DICOM object resulting from the conversion
+    *  @param proposedTS - [out] The proposed transfer syntax (needed e. g.
+    *                            by JPEG input plugin)
+@@ -49,6 +50,7 @@ public:
+    */
+   OFCondition convert(I2DImgSource *inputPlug,
+                       I2DOutputPlug *outPlug,
++                      OFList<OFString>* imageFiles,
+                       DcmDataset*& resultDset,
+                       E_TransferSyntax& proposedTS);
+ 
+@@ -118,6 +120,7 @@ public:
+                            OFBool insertMissingType2 = OFTrue,
+                            OFBool inventMissingType1 = OFTrue);
+ 
++
+   /** Destructor, frees plugin memory
+    *  @return none
+    */
+@@ -155,11 +158,13 @@ protected:
+   /** Reads pixel data and corresponding attributes like rows etc. from image
+    *  file and inserts them into dataset.
+    *  @param imageSource - [in] The input plugin that actually reads the pixel data
++   *  @param imageFiles - [in] The image input file(s) as source for the input plugin
+    *  @param dset - [out] The dataset to export the pixel data attributes to
+    *  @param outputTS - [out] The proposed transfex syntax of the dataset
+    *  @return EC_Normal, if successful, error otherwise
+    */
+   OFCondition readAndInsertPixelData( I2DImgSource* imageSource,
++                                      OFList<OFString>* imageFiles,
+                                       DcmDataset* dset,
+                                       E_TransferSyntax& outputTS);
+ 
+@@ -207,18 +212,6 @@ protected:
+ 
+ private:
+ 
+-  /** Correctly inserts encapsulated pixel data.
+-   *  @param dset [in] - The dataset to which we should add this.
+-   *  @param pixData [in] - The data to add.
+-   *  @param length [in] - The length of pixData.
+-   *  @param outputTS [in] - The output transfer syntax to be used
+-   *  @return EC_Normal, if successfull, error otherwise.
+-   */
+-  OFCondition insertEncapsulatedPixelData(DcmDataset* dset,
+-                                          char *pixData,
+-                                          Uint32 length,
+-                                          const E_TransferSyntax& outputTS) const;
+-
+   /* Attributes for writing DICOM dataset */
+ 
+   /// These attributes are applied to the dataset after conversion
+diff --git a/dcmdata/include/dcmtk/dcmdata/libi2d/i2dbmps.h b/dcmdata/include/dcmtk/dcmdata/libi2d/i2dbmps.h
+index 4db8479..aeb8e3e 100644
+--- a/dcmdata/include/dcmtk/dcmdata/libi2d/i2dbmps.h
++++ b/dcmdata/include/dcmtk/dcmdata/libi2d/i2dbmps.h
+@@ -49,37 +49,15 @@ public:
+    *  information is removed from the BMP stream.
+    *  This function allocates memory for the pixel data returned to the user.
+    *  The caller of this function is responsible for deleting the memory buffer.
+-   *  @param rows - [out] Rows of image
+-   *  @param cols - [out] Columns of image
+-   *  @param samplesPerPixel - [out] Number of components per pixel
+-   *  @param photoMetrInt - [out] The DICOM color model used for the compressed data
+-   *  @param bitsAlloc - [out] Bits Allocated for one sample
+-   *  @param bitsStored - [out] Bits Stored, Number of bits actually stored within
+-   *                            Bits Allocated
+-   *  @param highBit - [out] High Bit, Highest stored in bit within Bits Allocated
+-   *  @param pixelRepr - [out] Pixel Representation (0=unsigned, 1=signed)
+-   *  @param planConf - [out] Planar Configuration
+-   *  @param pixAspectH - [out] Horizontal value of pixel aspect ratio
+-   *  @param pixAspectV - [out] Vertical value of pixel aspect ratio
++   *  @param imgInfo - [out] Collection of Dicom Image Informations
++
+    *  @param pixData - [out] Pointer to the pixel data in BMP Interchange Format
+    *  @param length - [out] Length of pixel data
+-   *  @param ts - [out] The transfer syntax imposed by the imported pixel pixel data
+    *  @return EC_Normal, if successful, error otherwise
+    */
+-  OFCondition readPixelData( Uint16& rows,
+-                             Uint16& cols,
+-                             Uint16& samplesPerPixel,
+-                             OFString& photoMetrInt,
+-                             Uint16& bitsAlloc,
+-                             Uint16& bitsStored,
+-                             Uint16& highBit,
+-                             Uint16& pixelRepr,
+-                             Uint16& planConf,
+-                             Uint16& pixAspectH,
+-                             Uint16& pixAspectV,
++  OFCondition readPixelData( I2DImgDataInfo& imgInfo,
+                              char*&  pixData,
+-                             Uint32& length,
+-                             E_TransferSyntax& ts);
++                             Uint32& length);
+ 
+   /** After reading of pixel data, this function can be used for getting
+    *  information about lossy compression parameters.
+diff --git a/dcmdata/include/dcmtk/dcmdata/libi2d/i2dimgs.h b/dcmdata/include/dcmtk/dcmdata/libi2d/i2dimgs.h
+index 83b3b55..2be6a3a 100644
+--- a/dcmdata/include/dcmtk/dcmdata/libi2d/i2dimgs.h
++++ b/dcmdata/include/dcmtk/dcmdata/libi2d/i2dimgs.h
+@@ -29,6 +29,69 @@
+ #include "dcmtk/dcmdata/dcxfer.h"
+ #include "dcmtk/dcmdata/libi2d/i2define.h"
+ 
++struct I2DImgDataInfo
++{  
++  /** Helper structure for storing and comparing extracted pixel data image informations 
++   */
++
++  //Rows of image   
++  Uint16			rows;
++  //Columns of image
++  Uint16			cols;
++  //Number of components per pixel  
++  Uint16			samplesPerPixel;
++  //The DICOM color model used for the compressed data
++  OFString			photoMetrInt;
++  //Bits Allocated for one sample
++  Uint16			bitsAlloc;
++  //Bits Stored, number of bits stored within Bits Allocated
++  Uint16			bitsStored;
++  //High Bit, hightest bit position set within Bits Allocated
++  Uint16			highBit;
++  //Pixel Representation (0=unsigned, 1=signed)
++  Uint16			pixelRepr;
++  //Planar Configuration
++  Uint16			planConf;
++  //Horizontal value of pixel aspect ratio
++  Uint16			pixAspectH;
++  //Vertical value of pixel aspect ratio
++  Uint16			pixAspectV;
++
++  //The transfer syntax imposed by the imported pixel pixel data.
++  //This is necessary for the JPEG importer that needs to report
++  //which TS must be used for the imported JPEG data (ie. baseline, progressive, ...).
++  E_TransferSyntax	transSyn;
++
++  /** Compares if all members of both instances are equal
++   *  @param  other - [in] comparism instance
++   *  @return True if all member are identical, false otherwise
++   */
++  OFBool operator==(const I2DImgDataInfo& other)
++  {
++    return
++		(rows             == other.rows)				    &&
++		(cols				      == other.cols)				    &&
++		(samplesPerPixel	== other.samplesPerPixel)	&&
++		(photoMetrInt		  == other.photoMetrInt)		&&
++		(bitsAlloc			  == other.bitsAlloc)			  &&
++		(bitsStored			  == other.bitsStored)		  &&
++		(highBit			    == other.highBit)			    &&
++		(pixelRepr			  == other.pixelRepr)			  &&
++		(planConf			    == other.planConf)			  &&
++		(pixAspectH			  == other.pixAspectH)		  &&
++		(pixAspectV			  == other.pixAspectV)		  &&
++		(transSyn			    == other.transSyn);
++  };
++
++  OFBool operator!=(const I2DImgDataInfo& other)
++  {
++    return !(*this == other);
++  };
++
++
++};
++
++
+ /** Base Class for plugins extracting pixel data from standard image files
+  */
+ class DCMTK_I2D_EXPORT I2DImgSource
+@@ -49,36 +112,14 @@ public:
+    *  information about this pixel data.
+    *  This function allocates memory for the pixel data returned to the user.
+    *  The caller of this function is responsible for deleting the memory buffer
+-   *  @param rows - [out] Rows of image
+-   *  @param cols - [out] Columns of image
+-   *  @param samplesPerPixel - [out] Number of components per pixel
+-   *  @param photoMetrInt - [out] The DICOM color model used for the compressed data
+-   *  @param bitsAlloc - [out] Bits Allocated for one sample
+-   *  @param bitsStored - [out] Bits Stored, number of bits stored within Bits Allocated
+-   *  @param highBit - [out] High Bit, highest bit position set within Bits Allocated
+-   *  @param pixelRepr - [out] Pixel Representation (0=unsigned, 1=signed)
+-   *  @param planConf - [out] Planar Configuration
+-   *  @param pixAspectH - [out] Horizontal value of pixel aspect ratio
+-   *  @param pixAspectV - [out] Vertical value of pixel aspect ratio
++   *  @param imgInfo - [out] Collection of Dicom Image Informations
+    *  @param pixData - [out] Pointer to the pixel data
+    *  @param length - [out] Length of pixel data
+-   *  @param ts - [out] The transfer syntax imposed by the imported pixel pixel data
+    *  @return EC_Normal, if successful, error otherwise
+    */
+-  virtual OFCondition readPixelData( Uint16& rows,
+-                                     Uint16& cols,
+-                                     Uint16& samplesPerPixel,
+-                                     OFString& photoMetrInt,
+-                                     Uint16& bitsAlloc,
+-                                     Uint16& bitsStored,
+-                                     Uint16& highBit,
+-                                     Uint16& pixelRepr,
+-                                     Uint16& planConf,
+-                                     Uint16& pixAspectH,
+-                                     Uint16& pixAspectV,
++  virtual OFCondition readPixelData( I2DImgDataInfo& imgInfo,
+                                      char*&  pixData,
+-                                     Uint32& length,
+-                                     E_TransferSyntax& ts) =0;
++                                     Uint32& length) =0;
+ 
+   /** After reading of pixel data, this function can be used for getting
+    *  information about lossy compression parameters.
+diff --git a/dcmdata/include/dcmtk/dcmdata/libi2d/i2djpgs.h b/dcmdata/include/dcmtk/dcmdata/libi2d/i2djpgs.h
+index 4e4d404..95c6102 100644
+--- a/dcmdata/include/dcmtk/dcmdata/libi2d/i2djpgs.h
++++ b/dcmdata/include/dcmtk/dcmdata/libi2d/i2djpgs.h
+@@ -93,41 +93,15 @@ public:
+    *  The pixel data returned is a JPEG stream in JPEG interchange format.
+    *  This function allocates memory for the pixel data returned to the user.
+    *  The caller of this function is responsible for deleting the memory buffer.
+-   *  @param rows - [out] Rows of image
+-   *  @param cols - [out] Columns of image
+-   *  @param samplesPerPixel - [out] Number of components per pixel
+-   *  @param photoMetrInt - [out] The DICOM color model used for the compressed data
+-   *  @param bitsAlloc - [out] Bits Allocated for one sample
+-   *  @param bitsStored - [out] Bits Stored, Number of bits actually stored within
+-   *                            Bits Allocated
+-   *  @param highBit - [out] High Bit, Highest stored in bit within Bits Allocated
+-   *  @param pixelRepr - [out] Pixel Representation (0=unsigned, 1=signed)
+-   *  @param planConf - [out] Planar Configuration
+-   *  @param pixAspectH - [out] Horizontal value of pixel aspect ratio
+-   *  @param pixAspectV - [out] Vertical value of pixel aspect ratio
++   *  @param imgInfo - [out] Collection of Dicom Image Informations
+    *  @param pixData - [out] Pointer to the pixel data in JPEG Interchange Format
+    *                         (but without APPx markers).
+    *  @param length - [out] Length of pixel data
+-   *  @param ts - [out] The transfer syntax imposed by the imported pixel pixel
+-   *                    data. This is necessary for the JPEG importer that needs
+-   *                    to report which TS must be used for the imported JPEG data
+-   *                    (ie. baseline, progressive, ...).
+    *  @return EC_Normal, if successful, error otherwise
+    */
+-  OFCondition readPixelData( Uint16& rows,
+-                             Uint16& cols,
+-                             Uint16& samplesPerPixel,
+-                             OFString& photoMetrInt,
+-                             Uint16& bitsAlloc,
+-                             Uint16& bitsStored,
+-                             Uint16& highBit,
+-                             Uint16& pixelRepr,
+-                             Uint16& planConf,
+-                             Uint16& pixAspectH,
+-                             Uint16& pixAspectV,
++  OFCondition readPixelData( I2DImgDataInfo& imgInfo,
+                              char*&  pixData,
+-                             Uint32& length,
+-                             E_TransferSyntax& ts);
++                             Uint32& length);
+ 
+   /** After reading of pixel data, this function can be used for getting
+    *  information about lossy compression parameters.
+diff --git a/dcmdata/libi2d/i2d.cc b/dcmdata/libi2d/i2d.cc
+index 2b808d8..dcf6e8c 100644
+--- a/dcmdata/libi2d/i2d.cc
++++ b/dcmdata/libi2d/i2d.cc
+@@ -45,6 +45,7 @@ Image2Dcm::Image2Dcm() : m_overrideKeys(), m_templateFile(""),
+ 
+ OFCondition Image2Dcm::convert(I2DImgSource *inputPlug,
+                                I2DOutputPlug *outPlug,
++                               OFList<OFString>* imageFiles,
+                                DcmDataset*& resultDset,
+                                E_TransferSyntax& proposedTS)
+ 
+@@ -104,7 +105,7 @@ OFCondition Image2Dcm::convert(I2DImgSource *inputPlug,
+   generateUIDs(resultDset);
+ 
+   // Read and insert pixel data
+-  cond = readAndInsertPixelData(inputPlug, resultDset, proposedTS);
++  cond = readAndInsertPixelData(inputPlug, imageFiles, resultDset, proposedTS);
+   if (cond.bad())
+   {
+     delete resultDset; resultDset = NULL;
+@@ -398,144 +399,246 @@ void Image2Dcm::setISOLatin1(OFBool insLatin1)
+ }
+ 
+ 
+-OFCondition Image2Dcm::insertEncapsulatedPixelData(DcmDataset* dset,
+-                                                   char *pixData,
+-                                                   Uint32 length,
+-                                                   const E_TransferSyntax& outputTS) const
++OFCondition Image2Dcm::readAndInsertPixelData(I2DImgSource* imageSource,
++                                              OFList<OFString>* imageFiles,
++                                              DcmDataset* dset,
++                                              E_TransferSyntax& outputTS)
+ {
+-  OFCondition cond;
++	I2DImgDataInfo imgInfo, frameInfo;
++  imgInfo.transSyn = EXS_Unknown;
+ 
+-  DCMDATA_LIBI2D_DEBUG("Image2Dcm: Storing imported pixel data to DICOM file");
+-  // create initial pixel sequence
+-  DcmPixelSequence* pixelSequence = new DcmPixelSequence(DcmTag(DCM_PixelData, EVR_OB));
+-  if (pixelSequence == NULL)
+-    return EC_MemoryExhausted;
++  char* pixData = NULL;
++  Uint32 length;
+ 
+-  // insert empty offset table into sequence
+-  DcmPixelItem *offsetTable = new DcmPixelItem(DcmTag(DCM_Item, EVR_OB));
+-  if (offsetTable == NULL)
+-  {
+-    delete pixelSequence; pixelSequence = NULL;
+-    return EC_MemoryExhausted;
+-  }
+-  cond = pixelSequence->insert(offsetTable);
+-  if (cond.bad())
+-  {
+-    delete offsetTable; offsetTable = NULL;
+-    delete pixelSequence; pixelSequence = NULL;
+-    return cond;
+-  }
++  //check for having at least one image frame
++  if (imageFiles->empty())
++    return makeOFCondition(OFM_dcmdata, 18, OF_error, "No input file(s) available");
+ 
+-  // store compressed frame into pixel sequence
+-  DcmOffsetList dummyList;
+-  cond = pixelSequence->storeCompressedFrame(dummyList, OFreinterpret_cast(Uint8*,pixData), length, 0);
+-  // storeCompressedFrame(..) does a deep copy, so the pixData memory can be freed now
+-  delete[] pixData;
++ 
++  //decode first image
++  OFIterator<OFString> imageIter = imageFiles->begin();
++  OFIterator<OFString> imageEnd  = imageFiles->end();
++
++  imageSource->setImageFile(*imageIter);
++  OFCondition cond = imageSource->readPixelData(imgInfo, pixData, length);
+   if (cond.bad())
+-  {
+-    delete pixelSequence; pixelSequence = NULL;
+     return cond;
+-  }
+ 
+-  // insert pixel data attribute incorporating pixel sequence into dataset
+-  DcmPixelData *pixelData = new DcmPixelData(DCM_PixelData);
+-  if (pixelData == NULL)
+-  {
+-    delete pixelSequence; pixelSequence = NULL;
+-    return EC_MemoryExhausted;
+-  }
+-  /* tell pixel data element that this is the original presentation of the pixel data
+-   * pixel data and how it compressed
+-   */
+-  pixelData->putOriginalRepresentation(outputTS, NULL, pixelSequence);
+-  cond = dset->insert(pixelData);
+-  if (cond.bad())
++  //store transfer syntax
++  outputTS = imgInfo.transSyn;
++
++  //differ between encapsulated and raw image data and process all data and frames
++  // - also check for identical images
++  DcmXfer transport(imgInfo.transSyn);
++  if (transport.isEncapsulated())
+   {
+-    delete pixelData; pixelData = NULL; // also deletes contained pixel sequence
+-    return cond;
+-  }
++    //insert first pixel frame
++    DCMDATA_LIBI2D_DEBUG("Image2Dcm: Storing imported pixel data to DICOM file");
+ 
+-  return EC_Normal;
+-}
++    // create initial pixel sequence
++    DcmPixelSequence* pixelSequence = new DcmPixelSequence(DcmTag(DCM_PixelData, EVR_OB));
++    if (pixelSequence == NULL)
++      return EC_MemoryExhausted;
+ 
++    // insert empty offset table into sequence
++    DcmPixelItem *offsetTable = new DcmPixelItem(DcmTag(DCM_Item, EVR_OB));
++    if (offsetTable == NULL)
++    {
++      delete pixelSequence; pixelSequence = NULL;
++      return EC_MemoryExhausted;
++    }
++    cond = pixelSequence->insert(offsetTable);
++    if (cond.bad())
++    {
++      delete offsetTable; offsetTable = NULL;
++      delete pixelSequence; pixelSequence = NULL;
++      return cond;
++    }
+ 
+-OFCondition Image2Dcm::readAndInsertPixelData(I2DImgSource* imgSource,
+-                                              DcmDataset* dset,
+-                                              E_TransferSyntax& outputTS)
+-{
+-  Uint16 samplesPerPixel, rows, cols, bitsAlloc, bitsStored, highBit, pixelRepr, planConf;
+-  Uint16 pixAspectH =1; Uint16 pixAspectV = 1;
+-  OFString photoMetrInt;
+-  outputTS = EXS_Unknown;
+-  char* pixData = NULL;
+-  Uint32 length;
++    // store compressed frame into pixel seqeuence
++    DcmOffsetList dummyList;
++    cond = pixelSequence->storeCompressedFrame(dummyList, OFreinterpret_cast(Uint8*,pixData), length, 0);
++    // storeCompressedFrame(..) does a deep copy, so the pixdata memory can be freed now
++    delete[] pixData;
++    if (cond.bad())
++    {
++      delete pixelSequence; pixelSequence = NULL;
++      return cond;
++    }
+ 
+-  OFCondition cond = imgSource->readPixelData(rows, cols,
+-    samplesPerPixel, photoMetrInt, bitsAlloc, bitsStored, highBit, pixelRepr,
+-    planConf, pixAspectH, pixAspectV, pixData, length, outputTS);
++    //process all remaining frames
++    while( ++imageIter != imageEnd )
++    {
++      //decode next frame
++      imageSource->setImageFile(*imageIter);
++      OFCondition cond = imageSource->readPixelData(frameInfo, pixData, length);
++      if (cond.bad())
++        return cond;     
+ 
+-  if (cond.bad())
+-    return cond;
++      //compare for identical frame info: size, type, etc
++      if (frameInfo != imgInfo)
++        return makeOFCondition(OFM_dcmdata, 18, OF_error, "Input files differ in size and or type");
+ 
+-  DcmXfer transport(outputTS);
+-  if (transport.isEncapsulated())
+-    insertEncapsulatedPixelData(dset, pixData, length, outputTS);
++      //finaly add the new frame
++      cond = pixelSequence->storeCompressedFrame(dummyList, OFreinterpret_cast(Uint8*,pixData), length, 0);
++      // storeCompressedFrame(..) does a deep copy, so the pixdata memory can be freed now
++      delete[] pixData;
++      if (cond.bad())
++      {
++        delete pixelSequence; pixelSequence = NULL;
++        return cond;
++      }
++    }    
++
++    // insert pixel data attribute incorporating pixel sequence into dataset
++    DcmPixelData *pixelData = new DcmPixelData(DCM_PixelData);
++    if (pixelData == NULL)
++    {
++      delete pixelSequence; pixelSequence = NULL;
++      return EC_MemoryExhausted;
++    }
++    /* tell pixel data element that this is the original presentation of the pixel data
++      * pixel data and how it compressed
++      */
++    pixelData->putOriginalRepresentation(imgInfo.transSyn, NULL, pixelSequence);
++    cond = dset->insert(pixelData);
++    if (cond.bad())
++    {
++      delete pixelData; pixelData = NULL; // also deletes contained pixel sequence
++      return cond;
++    }
++  }
+   else
+   {
+     /* Not encapsulated */
+-    dset->putAndInsertUint8Array(DCM_PixelData, OFreinterpret_cast(Uint8*, pixData), length);
+-    delete[] pixData;
++
++    //single frame? just insert the data and finish
++    if (imageFiles->size() == 1)
++    {
++      cond = dset->putAndInsertUint8Array(DCM_PixelData, OFreinterpret_cast(Uint8*, pixData), length);
++      delete[] pixData;
++      if (cond.bad())
++        return cond;  
++    }
++    else
++    {
++      //multiframe
++      //try to allocate enough space for all image frames
++      // - first check, if we hit the 2GB limit
++      // - we need to allocate n times the first image size
++      Uint64 byteSize = Uint64(length) * Uint64(imageFiles->size());
++      if (byteSize > Uint64(2*1024)*Uint64(1024*1024))
++      {
++        delete[] pixData;
++        return makeOFCondition(OFM_dcmdata, 18, OF_error, "Multiframe image data size will exceed 2GB limit.");
++      }
++
++      //allocate enough space
++      char* frameData = new char[Uint32(byteSize)];
++      char* framePos = frameData;
++
++      //fill first frame
++      memcpy(framePos, pixData, length);
++      delete[] pixData;
++
++      //move to next frame position
++      framePos += length;
++
++      //process all remaining frames
++      while( ++imageIter != imageEnd )
++      {
++        //decode next frame
++        imageSource->setImageFile(*imageIter);
++        OFCondition cond = imageSource->readPixelData(frameInfo, pixData, length);
++        if (cond.bad())
++          return cond;     
++
++        //compare for identical frame info: size, type, etc
++        if (frameInfo != imgInfo)
++          return makeOFCondition(OFM_dcmdata, 18, OF_error, "Input files differ in size and or type");
++
++        //copy current frame data
++        memcpy(framePos, pixData, length);
++        delete[] pixData;
++
++        //move to next frame position
++        framePos += length;
++      } 
++
++      //now store the framedata inside dataset
++      //- avoid a deep copy /TODO
++      cond = dset->putAndInsertUint8Array(DCM_PixelData, OFreinterpret_cast(Uint8*, frameData), (framePos-frameData));
++      delete[] frameData; //TODO - remove the need for this
++
++      if (cond.bad())
++        return cond;  
++    }    
+   }
+ 
+   DCMDATA_LIBI2D_DEBUG("Image2Dcm: Inserting Image Pixel module information");
+ 
+-  cond = dset->putAndInsertUint16(DCM_SamplesPerPixel, samplesPerPixel);
++  cond = dset->putAndInsertUint16(DCM_SamplesPerPixel, frameInfo.samplesPerPixel);
+   if (cond.bad())
+     return cond;
+ 
+-  cond = dset->putAndInsertOFStringArray(DCM_PhotometricInterpretation, photoMetrInt);
++  cond = dset->putAndInsertOFStringArray(DCM_PhotometricInterpretation, frameInfo.photoMetrInt);
+   if (cond.bad())
+     return cond;
+ 
+   // Should only be written if Samples per Pixel > 1
+-  if (samplesPerPixel > 1)
++  if (frameInfo.samplesPerPixel > 1)
+   {
+-    cond = dset->putAndInsertUint16(DCM_PlanarConfiguration, planConf);
++    cond = dset->putAndInsertUint16(DCM_PlanarConfiguration, frameInfo.planConf);
+     if (cond.bad())
+       return cond;
+   }
+ 
+-  cond = dset->putAndInsertUint16(DCM_Rows, rows);
++  cond = dset->putAndInsertUint16(DCM_Rows, frameInfo.rows);
+   if (cond.bad())
+     return cond;
+ 
+-  cond = dset->putAndInsertUint16(DCM_Columns, cols);
++  cond = dset->putAndInsertUint16(DCM_Columns, frameInfo.cols);
+   if (cond.bad())
+     return cond;
+ 
+-  cond = dset->putAndInsertUint16(DCM_BitsAllocated, bitsAlloc);
++  cond = dset->putAndInsertUint16(DCM_BitsAllocated, frameInfo.bitsAlloc);
+   if (cond.bad())
+     return cond;
+ 
+-  cond = dset->putAndInsertUint16(DCM_BitsStored, bitsStored);
++  cond = dset->putAndInsertUint16(DCM_BitsStored, frameInfo.bitsStored);
+   if (cond.bad())
+     return cond;
+ 
+-  cond = dset->putAndInsertUint16(DCM_HighBit, highBit);
++  cond = dset->putAndInsertUint16(DCM_HighBit, frameInfo.highBit);
+   if (cond.bad())
+     return cond;
+ 
+-  if ( pixAspectH != pixAspectV )
++  //add frame count if multiframe image
++  if (imageFiles->size() > 1)
++  {
++    char buf[200];
++    int err = sprintf(buf, "%u", imageFiles->size());
++    if (err == -1) return EC_IllegalCall;
++    cond = dset->putAndInsertOFStringArray(DCM_NumberOfFrames, buf);
++    if (cond.bad())
++      return cond;
++
++    cond = dset->putAndInsertString(DCM_FrameIncrementPointer, "");
++    if (cond.bad())
++      return cond;
++  }
++
++  if ( frameInfo.pixAspectH != frameInfo.pixAspectV )
+   {
+     char buf[200];
+-    int err = sprintf(buf, "%u\\%u", pixAspectV, pixAspectH);
++    int err = sprintf(buf, "%u\\%u", frameInfo.pixAspectV, frameInfo.pixAspectH);
+     if (err == -1) return EC_IllegalCall;
+     cond = dset->putAndInsertOFStringArray(DCM_PixelAspectRatio, buf);
+     if (cond.bad())
+       return cond;
+   }
+ 
+-  return dset->putAndInsertUint16(DCM_PixelRepresentation, pixelRepr);
++  return dset->putAndInsertUint16(DCM_PixelRepresentation, frameInfo.pixelRepr);
+ }
+ 
+ 
+diff --git a/dcmdata/libi2d/i2dbmps.cc b/dcmdata/libi2d/i2dbmps.cc
+index 02a8836..94cf987 100644
+--- a/dcmdata/libi2d/i2dbmps.cc
++++ b/dcmdata/libi2d/i2dbmps.cc
+@@ -57,20 +57,9 @@ OFCondition I2DBmpSource::openFile(const OFString &filename)
+ }
+ 
+ 
+-OFCondition I2DBmpSource::readPixelData(Uint16& rows,
+-                                        Uint16& cols,
+-                                        Uint16& samplesPerPixel,
+-                                        OFString& photoMetrInt,
+-                                        Uint16& bitsAlloc,
+-                                        Uint16& bitsStored,
+-                                        Uint16& highBit,
+-                                        Uint16& pixelRepr,
+-                                        Uint16& planConf,
+-                                        Uint16& pixAspectH,
+-                                        Uint16& pixAspectV,
+-                                        char*&  pixData,
+-                                        Uint32& length,
+-                                        E_TransferSyntax &ts)
++OFCondition I2DBmpSource::readPixelData(I2DImgDataInfo& imgInfo,
++										char*&  pixData,
++										Uint32& length)
+ {
+   DCMDATA_LIBI2D_DEBUG("I2DBmpSource: Importing BMP pixel data");
+   OFCondition cond = openFile(m_imageFile);
+@@ -128,20 +117,20 @@ OFCondition I2DBmpSource::readPixelData(Uint16& rows,
+ 
+   /* Now we got all the info that we need, return it to caller */
+ 
+-  rows = height;
+-  cols = width;
+-  samplesPerPixel = 3;    /* 24 bpp */
++  imgInfo.rows = height;
++  imgInfo.cols = width;
++  imgInfo.samplesPerPixel = 3;    /* 24 bpp */
+ 
+-  bitsAlloc = 8;
+-  bitsStored = 8;
+-  highBit = 7;
+-  photoMetrInt = "RGB";
+-  planConf = 0;           /* For each pixel we save rgb in that order */
++  imgInfo.bitsAlloc = 8;
++  imgInfo.bitsStored = 8;
++  imgInfo.highBit = 7;
++  imgInfo.photoMetrInt = "RGB";
++  imgInfo.planConf = 0;           /* For each pixel we save rgb in that order */
+   pixData = data;
+   length = data_length;
+-  pixAspectH = pixAspectV = 1;
+-  pixelRepr = 0;
+-  ts = EXS_LittleEndianExplicit;
++  imgInfo.pixAspectH = imgInfo.pixAspectV = 1;
++  imgInfo.pixelRepr = 0;
++  imgInfo.transSyn = EXS_LittleEndianExplicit;
+ 
+   return cond;
+ }
+diff --git a/dcmdata/libi2d/i2djpgs.cc b/dcmdata/libi2d/i2djpgs.cc
+index bad687b..6f2cb7c 100644
+--- a/dcmdata/libi2d/i2djpgs.cc
++++ b/dcmdata/libi2d/i2djpgs.cc
+@@ -77,20 +77,9 @@ void I2DJpegSource::setKeepAPPn(const OFBool enabled)
+ }
+ 
+ 
+-OFCondition I2DJpegSource::readPixelData(Uint16& rows,
+-                                         Uint16& cols,
+-                                         Uint16& samplesPerPixel,
+-                                         OFString& photoMetrInt,
+-                                         Uint16& bitsAlloc,
+-                                         Uint16& bitsStored,
+-                                         Uint16& highBit,
+-                                         Uint16& pixelRepr,
+-                                         Uint16& planConf,
+-                                         Uint16& pixAspectH,
+-                                         Uint16& pixAspectV,
++OFCondition I2DJpegSource::readPixelData(I2DImgDataInfo& imgInfo,
+                                          char*&  pixData,
+-                                         Uint32& length,
+-                                         E_TransferSyntax &ts)
++                                         Uint32& length)
+ {
+   DCMDATA_LIBI2D_DEBUG("I2DJpegSource: Importing JPEG pixel data");
+   OFCondition cond = openFile(m_imageFile);
+@@ -136,7 +125,7 @@ OFCondition I2DJpegSource::readPixelData(Uint16& rows,
+   }
+ 
+   // Get transfer syntax associated with the given JPEG encoding
+-  ts = associatedTS(jpegEncoding);
++  imgInfo.transSyn = associatedTS(jpegEncoding);
+ 
+   // Extract width, height, samples per pixel, bits per sample
+   Uint16 width, height, spp, bps;
+@@ -191,25 +180,25 @@ OFCondition I2DJpegSource::readPixelData(Uint16& rows,
+       return cond;
+     }
+   }
+-  pixAspectH = aspectH;
+-  pixAspectV = aspectV;
++  imgInfo.pixAspectH = aspectH;
++  imgInfo.pixAspectV = aspectV;
+ 
+   // Collect information needed for image pixel module
+-  rows = height;
+-  cols = width;
+-  samplesPerPixel = spp;
+-  bitsAlloc = bps;
+-  bitsStored = bitsAlloc;
+-  highBit = OFstatic_cast(Uint16, bitsStored - 1);
+-  if (samplesPerPixel == 1)
+-    photoMetrInt = "MONOCHROME2";
+-  else if (samplesPerPixel == 3)
+-    photoMetrInt = "YBR_FULL_422";
++  imgInfo.rows = height;
++  imgInfo.cols = width;
++  imgInfo.samplesPerPixel = spp;
++  imgInfo.bitsAlloc = bps;
++  imgInfo.bitsStored = imgInfo.bitsAlloc;
++  imgInfo.highBit = OFstatic_cast(Uint16, imgInfo.bitsStored - 1);
++  if (imgInfo.samplesPerPixel == 1)
++    imgInfo.photoMetrInt = "MONOCHROME2";
++  else if (imgInfo.samplesPerPixel == 3)
++    imgInfo.photoMetrInt = "YBR_FULL_422";
+   else
+     return makeOFCondition(OFM_dcmdata, 18, OF_error, "For JPEG data, Samples per Pixel must be 1 or 3");
+   // Planar Configuration and Pixel Representation is always 0 for JPEG data
+-  planConf = 0;
+-  pixelRepr = 0;
++  imgInfo.planConf = 0;
++  imgInfo.pixelRepr = 0;
+ 
+   Uint32 tLength = 0;
+   char* tPixelData = NULL;
+diff --git a/dcmdata/libi2d/i2dplnsc.cc b/dcmdata/libi2d/i2dplnsc.cc
+index 72bb0f7..697e00d 100644
+--- a/dcmdata/libi2d/i2dplnsc.cc
++++ b/dcmdata/libi2d/i2dplnsc.cc
+@@ -95,8 +95,12 @@ OFCondition I2DOutputPlugNewSC::insertMultiFrameAttribs(DcmDataset* targetDatase
+   if (!targetDataset)
+     return EC_IllegalParameter;
+ 
+-  // We only support 1 image Multi-frames so far
+-  return targetDataset->putAndInsertOFStringArray(DCM_NumberOfFrames, "1");
++  //check for existing number of frames attribute - if not available add a 1-frame attribute
++  if (!targetDataset->tagExistsWithValue(DCM_NumberOfFrames))
++    return targetDataset->putAndInsertOFStringArray(DCM_NumberOfFrames, "1");
++  else
++    return EC_Normal;
++
+   // Frame Increment pointer is set later in the more specific SC Multi-frame Image context
+ }
+ 
+diff --git a/dcmdata/tests/ti2dbmp.cc b/dcmdata/tests/ti2dbmp.cc
+index 74d5ec4..9bf1c81 100644
+--- a/dcmdata/tests/ti2dbmp.cc
++++ b/dcmdata/tests/ti2dbmp.cc
+@@ -126,16 +126,12 @@ static bool writeImage(const void *pixelData, unsigned int pixelDataLength)
+ static bool readFile(char *&pixData, Uint32 &outputLength, Uint16 &rows, Uint16 &cols)
+ {
+     I2DBmpSource source;
+-    Uint16 samplesPerPixel, bitsAlloc, bitsStored;
+-    Uint16 highBit, pixelRepr, planConf, pixAspectH, pixAspectV;
+-    OFString photoMetrInt;
+-    E_TransferSyntax ts;
++    I2DImgDataInfo imgInfo;
+ 
+     source.setImageFile(temporaryFile);
+-    OFCondition res = source.readPixelData(rows, cols, samplesPerPixel, photoMetrInt,
+-                                           bitsAlloc, bitsStored, highBit, pixelRepr,
+-                                           planConf, pixAspectH, pixAspectV, pixData,
+-                                           outputLength, ts);
++    OFCondition res = source.readPixelData(imgInfo, pixData, outputLength);
++    rows = imgInfo.rows;
++    cols = imgInfo.cols;
+     if (res.bad())
+     {
+         LOG_DEBUG("Reading file failed: " << res.text());
+-- 
+1.9.5.msysgit.1
+
