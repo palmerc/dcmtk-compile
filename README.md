@@ -2,7 +2,7 @@
 
 To compile you'll need to first checkout the correct tagged version of the 3.6.1 series.
 
->> DCMTK-3.6.1_20150629
+> DCMTK-3.6.1_20150629
 
 You need to apply the patch for Multiframe from support issue 661.
 
